@@ -85,36 +85,36 @@ pip install numpy matplotlib seaborn h5py
 
 ## Quickstart
 
-Place `lemurs_corr_analysis.py` at your repo root.
+
 
 ### 1) Stratified correlation matrices (multi-page PDF)
 
 ```bash
-python lemurs_corr_analysis.py corr --data path/to/file.h5   --n-energy-bins 10 --n-theta-bins 10 --n-phi-bins 10   --min-samples 50 --save stratified_correlations.pdf
+python lemurs_analysis.py corr --data path/to/file.h5   --n-energy-bins 10 --n-theta-bins 10 --n-phi-bins 10   --min-samples 50 --save stratified_correlations.pdf
 ```
 
 ### 2) Stratified mean profiles (optionally per-event normalized)
 
 ```bash
-python lemurs_corr_analysis.py means --data path/to/file.h5   --n-energy-bins 10 --n-theta-bins 10 --n-phi-bins 10   --min-samples 50 --normalize-per-event   --save mean_profiles_stratified.pdf
+python lemurs_analysis.py means --data path/to/file.h5   --n-energy-bins 10 --n-theta-bins 10 --n-phi-bins 10   --min-samples 50 --normalize-per-event   --save mean_profiles_stratified.pdf
 ```
 
 ### 3) ϕ/r-bin shift analyses (layer-like)
 
 ```bash
-python lemurs_corr_analysis.py phi-r --data path/to/file.h5   --n-theta-bins 10 --n-phi-bins 4 --min-samples 50   --save-phi angular_bin_shifts_analysis.pdf   --save-r   radial_bin_shifts_analysis.pdf
+python lemurs_analysis.py phi-r --data path/to/file.h5   --n-theta-bins 10 --n-phi-bins 4 --min-samples 50   --save-phi angular_bin_shifts_analysis.pdf   --save-r   radial_bin_shifts_analysis.pdf
 ```
 
 ### 4) Layer-wise shift analysis (original idea)
 
 ```bash
-python lemurs_corr_analysis.py layer-shifts --data path/to/file.h5   --n-theta-bins 10 --n-phi-bins 4 --min-samples 50   --save layer_shifts_analysis.pdf
+python lemurs_analysis.py layer-shifts --data path/to/file.h5   --n-theta-bins 10 --n-phi-bins 4 --min-samples 50   --save layer_shifts_analysis.pdf
 ```
 
 ### 5) Global (all-data) correlations for layers/ϕ/r
 
 ```bash
-python lemurs_corr_analysis.py global-corr --data path/to/file.h5   --save global_correlations.pdf
+python lemurs_analysis.py global-corr --data path/to/file.h5   --save global_correlations.pdf
 ```
 
 ---
