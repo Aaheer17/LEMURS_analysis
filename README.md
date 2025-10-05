@@ -1,6 +1,7 @@
 # LEMURS Correlation & Profile Analysis
 
 A single, git-ready script to compute and visualize calorimeter shower correlations and profiles across layers, angular (ϕ) bins, and radial (r) bins. It supports both NPZ and HDF5 inputs and produces clear, multi-page PDF reports.
+
 **Data**: For the experiment, download the dataset from **Zenodo**: [https://zenodo.org/records/17045562](https://zenodo.org/records/17045562).
 
 
