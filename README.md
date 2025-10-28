@@ -124,7 +124,8 @@ python lemurs_analysis.py global-corr --data path/to/file.h5   --save global_cor
 
 ## Command Reference
 
-All commands accept `--data` with `.npz` or `.h5/.hdf5`.
+All commands accept `--data` with `.npz` or `.h5/.hdf5` and `--dataset` with `cc2` for the CaloChallenge 2022 dataset and `lemurs` for the LEMURS dataset.
+
 
 ### `corr`
 
