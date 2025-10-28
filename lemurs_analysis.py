@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 import h5py  # for .h5/.hdf5 loading
-
+import xml.etree.ElementTree as ET
 
 # ============================ Utilities ============================
 
@@ -46,6 +46,100 @@ def _tickify(ax, k: int, prefix: str, step: int | None = None):
     ax.set_xticklabels([f"{prefix}{i}" for i in ticks], rotation=0, fontsize=8)
     ax.set_yticklabels([f"{prefix}{i}" for i in ticks], rotation=0, fontsize=8)
 
+    
+def dims_from_xml(xml_path: str):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    layers = root.findall(".//Layer")
+    assert len(layers) > 0, "No <Layer> elements found."
+    L = len(layers)
+
+    # check consistency across layers
+    phi_vals = []
+    rbin_vals = []
+    for ly in layers:
+        n_phi = int(ly.attrib["n_bin_alpha"])
+        phi_vals.append(n_phi)
+        edges = [e.strip() for e in ly.attrib["r_edges"].split(",") if e.strip() != ""]
+        rbin_vals.append(len(edges) - 1)
+
+    # ensure all layers use the same binning
+    assert len(set(phi_vals)) == 1, f"Inconsistent n_bin_alpha across layers: {set(phi_vals)}"
+    assert len(set(rbin_vals)) == 1, f"Inconsistent r bin counts across layers: {set(rbin_vals)}"
+    P = phi_vals[0]
+    R = rbin_vals[0]
+    return L, P, R
+
+def reshape_flat_using_xml(X_flat: np.ndarray, xml_path: str, order="LPR"):
+    """
+    X_flat: [N, 6480]
+    order: the flattening order used originally (default assumes [L, P, R] contiguous).
+           Valid strings are permutations of 'L','P','R'.
+    Returns X with shape [N, 45, 16, 9] based on the XML.
+    """
+    assert X_flat.ndim == 2, f"Expected [N, D], got {X_flat.shape}"
+    L, P, R = dims_from_xml(xml_path)
+    D = L * P * R
+    assert X_flat.shape[1] == D, f"Feature dim {X_flat.shape[1]} != L*P*R={D} from XML."
+
+    # reshape into the original order, then permute to L,P,R
+    shape_in = tuple({"L": L, "P": P, "R": R}[c] for c in order)  # e.g. (L,P,R)
+    X = X_flat.reshape(-1, *shape_in)
+
+    # permute to L,P,R
+    pos = {c: i for i, c in enumerate(order)}
+    X = X.transpose((0, 1 + order.index("L"), 1 + order.index("P"), 1 + order.index("R")))
+    return X  # [N,45,16,9] for your XML
+def _has_angles(theta, phi, n_theta_bins: int, n_phi_bins: int) -> bool:
+    """True only if angles are provided AND you asked for nonzero bins."""
+    return (theta is not None) and (phi is not None) and (n_theta_bins > 0) and (n_phi_bins > 0)
+
+def _stratify_ids(E_inc, theta, phi, n_energy_bins: int, n_theta_bins: int, n_phi_bins: int,
+                  percentile_bins: bool = False):
+    """
+    Returns (bin_ids, strat_label, strat_kind)
+      - bin_ids: np.array shape [N] with integers 0..K-1
+      - strat_label: short text for figure titles
+      - strat_kind: 'angles' or 'energy'
+    If angles are missing or bins set to 0, falls back to energy bins.
+    """
+    
+
+    if _has_angles(theta, phi, n_theta_bins, n_phi_bins):
+        # θ/φ binning (your current logic here)
+        tmin, tmax = float(np.nanmin(theta)), float(np.nanmax(theta))
+        pmin, pmax = -np.pi, np.pi  # or your stored range
+        t_edges = np.linspace(tmin, tmax, n_theta_bins + 1)
+        p_edges = np.linspace(pmin, pmax, n_phi_bins + 1)
+        t_idx = np.digitize(theta, t_edges) - 1
+        p_idx = np.digitize(phi,   p_edges) - 1
+        # combine to a single id  (θ major)
+        bin_ids = (t_idx * n_phi_bins + p_idx).astype(int)
+        label = f"θ×φ bins ({n_theta_bins}×{n_phi_bins})"
+        return bin_ids, label, 'angles'
+    else:
+        # Energy binning (fallback when no angles OR bins==0)
+        assert E_inc is not None, "E_inc required for energy stratification"
+        if percentile_bins:
+            qs = np.linspace(0, 100, n_energy_bins + 1)
+            edges = np.percentile(E_inc, qs)
+            # ensure strictly increasing to avoid edge collisions
+            edges = np.unique(edges)
+            # if heavy ties reduce bins, ensure at least 2 edges
+            if edges.size < 2:
+                edges = np.array([E_inc.min(), E_inc.max()])
+        else:
+            emin, emax = float(np.nanmin(E_inc)), float(np.nanmax(E_inc))
+            edges = np.linspace(emin, emax, n_energy_bins + 1)
+        # guard if n_energy_bins might be 0
+        if len(edges) < 2:
+            # put everything into a single bin
+            bin_ids = np.zeros_like(E_inc, dtype=int)
+            label = "all data (no strat)"
+        else:
+            bin_ids = np.digitize(E_inc, edges) - 1
+            label = f"energy bins ({len(edges)-1})"
+        return bin_ids, label, 'energy'
 
 def plot_grid(
     mats: List[np.ndarray],
@@ -118,28 +212,36 @@ def _load_npz(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
     return to_numpy(X), to_numpy(E), to_numpy(th), to_numpy(ph)
 
 
-def _load_h5(h5_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _load_h5(h5_path: Path, dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """HDF5 datasets:
         showers          : (N, R, Phi, Z)  -> transpose to (N, Z, Phi, R) = (N,45,16,9)
         incident_energy  : (N,)
         incident_theta   : (N,)
         incident_phi     : (N,)
     """
-    with h5py.File(h5_path, "r") as f:
-        showers = f["showers"][:]               # (N, R, Phi, Z)
-        E_inc   = f["incident_energy"][:]
-        theta   = f["incident_theta"][:]
-        phi     = f["incident_phi"][:]
-    X = np.transpose(showers, (0, 3, 2, 1)).copy()  # -> (N, Z, Phi, R) = (N,45,16,9)
+    if dataset=='lemurs':
+        with h5py.File(h5_path, "r") as f:
+            showers = f["showers"][:]               # (N, R, Phi, Z)
+            E_inc   = f["incident_energy"][:]
+            theta   = f["incident_theta"][:]
+            phi     = f["incident_phi"][:]
+        X = np.transpose(showers, (0, 3, 2, 1)).copy()  # -> (N, Z, Phi, R) = (N,45,16,9)
+    else: 
+        with h5py.File(h5_path, "r") as f:
+            showers = f["showers"][:]               # (N, R, Phi, Z)
+            E_inc   = f["incident_energies"][:]
+            theta=None
+            phi=None
+        X=showers
     return X, E_inc, theta, phi
 
 
-def _load_any(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _load_any(path: Path, dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     suf = path.suffix.lower()
     if suf == ".npz":
         return _load_npz(path)
     if suf in (".h5", ".hdf5"):
-        return _load_h5(path)
+        return _load_h5(path, dataset)
     raise ValueError(f"Unsupported input: {path} (expected .npz, .h5, .hdf5)")
 
 
@@ -156,17 +258,61 @@ def compute_stratified_correlations(
     min_samples: int = 50,
     save_path: str = 'stratified_correlations.pdf',
     annotate: bool = False,
-    ncols: int = 3
+    ncols: int = 3,
+    normalize_per_event: bool = False,   
+    use_log1p: bool = False,             
+    use_spearman: bool = False,          
+    eps: float = 1e-12                  
 ) -> Dict[str, list]:
     """Stratified correlation matrices across Layers/φ/r; writes a multi-page PDF."""
-    X = to_numpy(shower); E = to_numpy(E_inc); th = to_numpy(theta); ph = to_numpy(phi)
+    #X = to_numpy(shower); E = to_numpy(E_inc); 
+    X = to_numpy(shower)
+    E = np.asarray(E_inc).reshape(-1)      # <-- ensure (N,)
     assert X.ndim == 4 and X.shape[1:] == (45, 16, 9), f"Expected (N,45,16,9), got {X.shape}"
 
     E_bins  = np.percentile(E, np.linspace(0, 100, n_energy_bins + 1))
-    th_bins = np.linspace(th.min(), th.max(), n_theta_bins + 1)
-    ph_bins = np.linspace(ph.min(), ph.max(), n_phi_bins + 1)
-
+    if _has_angles(theta, phi, n_theta_bins, n_phi_bins):
+        th = to_numpy(theta); ph = to_numpy(phi)
+        th_bins = np.linspace(th.min(), th.max(), n_theta_bins + 1)
+        ph_bins = np.linspace(ph.min(), ph.max(), n_phi_bins + 1)
+    else: 
+        th=None; ph=None
+        th_bins=0
+        ph_bins=0
     results = {'energy': [], 'theta': [], 'phi': []}
+    def _maybe_normalize_eventwise(X_block: np.ndarray) -> np.ndarray:
+        # shape (Nb, 45, 16, 9) -> normalise each event by its total deposited energy
+        if not normalize_per_event:
+            return X_block
+        totals = X_block.sum(axis=(1,2,3), keepdims=True)
+        return X_block / (totals + eps)
+
+    def _prep_features(F: np.ndarray) -> np.ndarray:
+        """
+        F is (Nb, K). Apply log1p and/or rank transform before correlation.
+        - use_log1p: Pearson on log1p(F) (variance-stabilised).
+        - use_spearman: Pearson on ranks(F) (Spearman).
+        If both flags are True, ranks are taken on log1p(F).
+        """
+        G = F
+        if use_log1p:
+            G = np.log1p(np.maximum(G, 0.0))  # energies are >=0; guard anyway
+        if use_spearman:
+            # rank each column (average ranks for ties) without SciPy:
+            # argsort twice trick -> dense ranks; for ties, average via grouping
+            # For simplicity and robustness, if you have SciPy available, use rankdata.
+            try:
+                from scipy.stats import rankdata
+                G = np.apply_along_axis(rankdata, 0, G, method='average')
+            except Exception:
+                # Fallback dense ranks (ties get same integer rank)
+                order = np.argsort(G, axis=0)
+                ranks = np.empty_like(order, dtype=float)
+                # assign ranks column-wise
+                for k in range(G.shape[1]):
+                    ranks[order[:,k], k] = np.arange(1, G.shape[0]+1)
+                G = ranks
+        return G
 
     with PdfPages(save_path) as pdf:
         # ---- Energy strata ----
@@ -174,12 +320,20 @@ def compute_stratified_correlations(
         for i in range(n_energy_bins):
             lo, hi = E_bins[i], E_bins[i + 1]
             mask = (E >= lo) & ((E <= hi) if i == n_energy_bins - 1 else (E < hi))
+            mask = mask.ravel()   
+            #mask = (E >= lo) & ((E <= hi) if i == n_energy_bins - 1 else (E < hi))
             if mask.sum() < min_samples:
                 continue
-            Xb = X[mask]
+            #Xb = X[mask]
+            Xb = _maybe_normalize_eventwise(X[mask])
             feat_layers = Xb.sum(axis=(2, 3))
             feat_phi    = Xb.sum(axis=(1, 3))
             feat_r      = Xb.sum(axis=(1, 2))
+
+            feat_layers = _prep_features(feat_layers)
+            feat_phi    = _prep_features(feat_phi)
+            feat_r      = _prep_features(feat_r)
+
             C_layers = corrcoef_safe(feat_layers)
             C_phi    = corrcoef_safe(feat_phi)
             C_r      = corrcoef_safe(feat_r)
@@ -199,10 +353,15 @@ def compute_stratified_correlations(
             mask = (th >= lo) & ((th <= hi) if i == n_theta_bins - 1 else (th < hi))
             if mask.sum() < min_samples:
                 continue
-            Xb = X[mask]
+            Xb = _maybe_normalize_eventwise(X[mask])
             feat_layers = Xb.sum(axis=(2, 3))
             feat_phi    = Xb.sum(axis=(1, 3))
             feat_r      = Xb.sum(axis=(1, 2))
+
+            feat_layers = _prep_features(feat_layers)
+            feat_phi    = _prep_features(feat_phi)
+            feat_r      = _prep_features(feat_r)
+
             C_layers = corrcoef_safe(feat_layers)
             C_phi    = corrcoef_safe(feat_phi)
             C_r      = corrcoef_safe(feat_r)
@@ -222,10 +381,15 @@ def compute_stratified_correlations(
             mask = (ph >= lo) & ((ph <= hi) if i == n_phi_bins - 1 else (ph < hi))
             if mask.sum() < min_samples:
                 continue
-            Xb = X[mask]
+            Xb = _maybe_normalize_eventwise(X[mask])
             feat_layers = Xb.sum(axis=(2, 3))
             feat_phi    = Xb.sum(axis=(1, 3))
             feat_r      = Xb.sum(axis=(1, 2))
+
+            feat_layers = _prep_features(feat_layers)
+            feat_phi    = _prep_features(feat_phi)
+            feat_r      = _prep_features(feat_r)
+
             C_layers = corrcoef_safe(feat_layers)
             C_phi    = corrcoef_safe(feat_phi)
             C_r      = corrcoef_safe(feat_r)
@@ -239,26 +403,27 @@ def compute_stratified_correlations(
             pdf.savefig(fig); plt.close(fig)
 
         # ---- Angular- & radial-bin correlations by strata ----
-        for key, label, xlabel, tick_prefix in [
-            ('C_phi', 'Angular-Bin (ϕ) Correlations', 'ϕ bin j', 'ϕ'),
-            ('C_r',   'Radial-Bin (r) Correlations',  'r bin j', 'r'),
-        ]:
-            for section, stitle in [('energy', 'Incident Energy'),
-                                    ('theta',  'Incident θ'),
-                                    ('phi',    'Incident φ')]:
-                if results[section]:
-                    mats = [res[key] for res in results[section]]
-                    titles = [
-                        f"{stitle}: " +
-                        (f"E ∈ [{lo:.0f}, {hi:.0f}] MeV" if section == 'energy'
-                         else f"θ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]" if section == 'theta'
-                         else f"φ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]") +
-                        f"\nN={res['N']:,}"
-                        for res in results[section] for (lo, hi) in [res['range']]
-                    ]
-                    fig = plot_grid(mats, titles, xlabel, xlabel.replace('j', 'i'), tick_prefix, annotate, ncols)
-                    fig.suptitle(f"{label} Stratified by {stitle}", fontsize=12, fontweight='bold')
-                    pdf.savefig(fig); plt.close(fig)
+        if _has_angles(theta, phi, n_theta_bins, n_phi_bins):
+            for key, label, xlabel, tick_prefix in [
+                ('C_phi', 'Angular-Bin (ϕ) Correlations', 'ϕ bin j', 'ϕ'),
+                ('C_r',   'Radial-Bin (r) Correlations',  'r bin j', 'r'),
+            ]:
+                for section, stitle in [('energy', 'Incident Energy'),
+                                        ('theta',  'Incident θ'),
+                                        ('phi',    'Incident φ')]:
+                    if results[section]:
+                        mats = [res[key] for res in results[section]]
+                        titles = [
+                            f"{stitle}: " +
+                            (f"E ∈ [{lo:.0f}, {hi:.0f}] MeV" if section == 'energy'
+                             else f"θ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]" if section == 'theta'
+                             else f"φ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]") +
+                            f"\nN={res['N']:,}"
+                            for res in results[section] for (lo, hi) in [res['range']]
+                        ]
+                        fig = plot_grid(mats, titles, xlabel, xlabel.replace('j', 'i'), tick_prefix, annotate, ncols)
+                        fig.suptitle(f"{label} Stratified by {stitle}", fontsize=12, fontweight='bold')
+                        pdf.savefig(fig); plt.close(fig)
 
     print(f"[write] {save_path}")
     return results
@@ -280,7 +445,7 @@ def compute_and_plot_mean_profiles(
     show_ci: bool = True
 ) -> Dict[str, list]:
     """Stratified mean ± SEM profiles for Layers/ϕ/r; writes a multi-page PDF."""
-    X = to_numpy(shower); E = to_numpy(E_inc); th = to_numpy(theta); ph = to_numpy(phi)
+    X = to_numpy(shower); E = to_numpy(E_inc); #th = to_numpy(theta); ph = to_numpy(phi)
     assert X.ndim == 4 and X.shape[1:] == (45, 16, 9), f"Expected (N,45,16,9), got {X.shape}"
 
     def _bin_edges(values, n_bins, pct=False):
@@ -348,8 +513,16 @@ def compute_and_plot_mean_profiles(
 
     # Binning
     E_edges  = _bin_edges(E, n_energy_bins, pct=use_percentile_bins)
-    th_edges = _bin_edges(th, n_theta_bins, pct=False)
-    ph_edges = _bin_edges(ph, n_phi_bins, pct=False)
+    has_angles= _has_angles(theta, phi, n_theta_bins, n_phi_bins)
+    if has_angles:
+        th = to_numpy(theta); ph = to_numpy(phi)
+        th_edges = _bin_edges(th, n_theta_bins, pct=False)
+        ph_edges = _bin_edges(ph, n_phi_bins, pct=False)
+    else: 
+        th=None; ph=None
+        th_edges=0
+        ph_edges=0
+   
 
     results = {"energy": [], "theta": [], "phi": []}
 
@@ -362,6 +535,7 @@ def compute_and_plot_mean_profiles(
             Nb = int(mask.sum())
             if Nb < min_samples:
                 continue
+            mask = mask.ravel()
             Xb = X[mask]
             prof = _profiles_from_X(Xb, normalize=normalize_per_event)
             results['energy'].append({'range': (lo, hi), **prof})
@@ -390,80 +564,80 @@ def compute_and_plot_mean_profiles(
                     try: ax.set_yscale('log')
                     except Exception: pass
             fig.suptitle('Mean Radial (r-bin) Energy — Stratified by Incident Energy', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
-
-        # Theta
-        t_titles_L, t_prof_L = [], []
-        t_titles_P, t_prof_P = [], []
-        t_titles_R, t_prof_R = [], []
-        for mask, (lo, hi) in _bin_masks(th, th_edges):
-            Nb = int(mask.sum())
-            if Nb < min_samples:
-                continue
-            Xb = X[mask]
-            prof = _profiles_from_X(Xb, normalize=normalize_per_event)
-            results['theta'].append({'range': (lo, hi), **prof})
-            t = f"θ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]\nN={Nb:,}"
-            t_titles_L.append(t); t_prof_L.append({'mean_layers': prof['mean_layers'], 'sem_layers': prof['sem_layers']})
-            t_titles_P.append(t); t_prof_P.append({'mean_phi':    prof['mean_phi'],    'sem_phi':    prof['sem_phi']})
-            t_titles_R.append(t); t_prof_R.append({'mean_r':      prof['mean_r'],      'sem_r':      prof['sem_r']})
-        if t_prof_L:
-            fig = _plot_profile_grid(t_prof_L, t_titles_L, 'Layer index', 'Mean deposited energy', 'L', ncols=ncols, show_ci=show_ci)
-            if not normalize_per_event:
-                for ax in np.atleast_1d(fig.axes): 
-                    try: ax.set_yscale('log')
-                    except Exception: pass
-            fig.suptitle('Mean Layer Energy — Stratified by Incident θ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
-
-            fig = _plot_profile_grid(t_prof_P, t_titles_P, 'ϕ-bin index', 'Mean deposited energy', 'ϕ', ncols=ncols, show_ci=show_ci, x_tick_step=2)
-            if not normalize_per_event:
-                for ax in np.atleast_1d(fig.axes): 
-                    try: ax.set_yscale('log')
-                    except Exception: pass
-            fig.suptitle('Mean Angular (ϕ-bin) Energy — Stratified by Incident θ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
-
-            fig = _plot_profile_grid(t_prof_R, t_titles_R, 'r-bin index', 'Mean deposited energy', 'r', ncols=ncols, show_ci=show_ci, x_tick_step=1)
-            if not normalize_per_event:
-                for ax in np.atleast_1d(fig.axes): 
-                    try: ax.set_yscale('log')
-                    except Exception: pass
-            fig.suptitle('Mean Radial (r-bin) Energy — Stratified by Incident θ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
-
-        # Phi
-        p_titles_L, p_prof_L = [], []
-        p_titles_P, p_prof_P = [], []
-        p_titles_R, p_prof_R = [], []
-        for mask, (lo, hi) in _bin_masks(ph, ph_edges):
-            Nb = int(mask.sum())
-            if Nb < min_samples:
-                continue
-            Xb = X[mask]
-            prof = _profiles_from_X(Xb, normalize=normalize_per_event)
-            results['phi'].append({'range': (lo, hi), **prof})
-            t = f"φ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]\nN={Nb:,}"
-            p_titles_L.append(t); p_prof_L.append({'mean_layers': prof['mean_layers'], 'sem_layers': prof['sem_layers']})
-            p_titles_P.append(t); p_prof_P.append({'mean_phi':    prof['mean_phi'],    'sem_phi':    prof['sem_phi']})
-            p_titles_R.append(t); p_prof_R.append({'mean_r':      prof['mean_r'],      'sem_r':      prof['sem_r']})
-        if p_prof_L:
-            fig = _plot_profile_grid(p_prof_L, p_titles_L, 'Layer index', 'Mean deposited energy', 'L', ncols=ncols, show_ci=show_ci)
-            if not normalize_per_event:
-                for ax in np.atleast_1d(fig.axes): 
-                    try: ax.set_yscale('log')
-                    except Exception: pass
-            fig.suptitle('Mean Layer Energy — Stratified by Incident φ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
-
-            fig = _plot_profile_grid(p_prof_P, p_titles_P, 'ϕ-bin index', 'Mean deposited energy', 'ϕ', ncols=ncols, show_ci=show_ci, x_tick_step=2)
-            if not normalize_per_event:
-                for ax in np.atleast_1d(fig.axes): 
-                    try: ax.set_yscale('log')
-                    except Exception: pass
-            fig.suptitle('Mean Angular (ϕ-bin) Energy — Stratified by Incident φ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
-
-            fig = _plot_profile_grid(p_prof_R, p_titles_R, 'r-bin index', 'Mean deposited energy', 'r', ncols=ncols, show_ci=show_ci, x_tick_step=1)
-            if not normalize_per_event:
-                for ax in np.atleast_1d(fig.axes): 
-                    try: ax.set_yscale('log')
-                    except Exception: pass
-            fig.suptitle('Mean Radial (r-bin) Energy — Stratified by Incident φ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
+        if has_angles:
+            # Theta
+            t_titles_L, t_prof_L = [], []
+            t_titles_P, t_prof_P = [], []
+            t_titles_R, t_prof_R = [], []
+            for mask, (lo, hi) in _bin_masks(th, th_edges):
+                Nb = int(mask.sum())
+                if Nb < min_samples:
+                    continue
+                Xb = X[mask]
+                prof = _profiles_from_X(Xb, normalize=normalize_per_event)
+                results['theta'].append({'range': (lo, hi), **prof})
+                t = f"θ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]\nN={Nb:,}"
+                t_titles_L.append(t); t_prof_L.append({'mean_layers': prof['mean_layers'], 'sem_layers': prof['sem_layers']})
+                t_titles_P.append(t); t_prof_P.append({'mean_phi':    prof['mean_phi'],    'sem_phi':    prof['sem_phi']})
+                t_titles_R.append(t); t_prof_R.append({'mean_r':      prof['mean_r'],      'sem_r':      prof['sem_r']})
+            if t_prof_L:
+                fig = _plot_profile_grid(t_prof_L, t_titles_L, 'Layer index', 'Mean deposited energy', 'L', ncols=ncols, show_ci=show_ci)
+                if not normalize_per_event:
+                    for ax in np.atleast_1d(fig.axes): 
+                        try: ax.set_yscale('log')
+                        except Exception: pass
+                fig.suptitle('Mean Layer Energy — Stratified by Incident θ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
+    
+                fig = _plot_profile_grid(t_prof_P, t_titles_P, 'ϕ-bin index', 'Mean deposited energy', 'ϕ', ncols=ncols, show_ci=show_ci, x_tick_step=2)
+                if not normalize_per_event:
+                    for ax in np.atleast_1d(fig.axes): 
+                        try: ax.set_yscale('log')
+                        except Exception: pass
+                fig.suptitle('Mean Angular (ϕ-bin) Energy — Stratified by Incident θ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
+    
+                fig = _plot_profile_grid(t_prof_R, t_titles_R, 'r-bin index', 'Mean deposited energy', 'r', ncols=ncols, show_ci=show_ci, x_tick_step=1)
+                if not normalize_per_event:
+                    for ax in np.atleast_1d(fig.axes): 
+                        try: ax.set_yscale('log')
+                        except Exception: pass
+                fig.suptitle('Mean Radial (r-bin) Energy — Stratified by Incident θ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
+    
+            # Phi
+            p_titles_L, p_prof_L = [], []
+            p_titles_P, p_prof_P = [], []
+            p_titles_R, p_prof_R = [], []
+            for mask, (lo, hi) in _bin_masks(ph, ph_edges):
+                Nb = int(mask.sum())
+                if Nb < min_samples:
+                    continue
+                Xb = X[mask]
+                prof = _profiles_from_X(Xb, normalize=normalize_per_event)
+                results['phi'].append({'range': (lo, hi), **prof})
+                t = f"φ_inc ∈ [{np.degrees(lo):.1f}°, {np.degrees(hi):.1f}°]\nN={Nb:,}"
+                p_titles_L.append(t); p_prof_L.append({'mean_layers': prof['mean_layers'], 'sem_layers': prof['sem_layers']})
+                p_titles_P.append(t); p_prof_P.append({'mean_phi':    prof['mean_phi'],    'sem_phi':    prof['sem_phi']})
+                p_titles_R.append(t); p_prof_R.append({'mean_r':      prof['mean_r'],      'sem_r':      prof['sem_r']})
+            if p_prof_L:
+                fig = _plot_profile_grid(p_prof_L, p_titles_L, 'Layer index', 'Mean deposited energy', 'L', ncols=ncols, show_ci=show_ci)
+                if not normalize_per_event:
+                    for ax in np.atleast_1d(fig.axes): 
+                        try: ax.set_yscale('log')
+                        except Exception: pass
+                fig.suptitle('Mean Layer Energy — Stratified by Incident φ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
+    
+                fig = _plot_profile_grid(p_prof_P, p_titles_P, 'ϕ-bin index', 'Mean deposited energy', 'ϕ', ncols=ncols, show_ci=show_ci, x_tick_step=2)
+                if not normalize_per_event:
+                    for ax in np.atleast_1d(fig.axes): 
+                        try: ax.set_yscale('log')
+                        except Exception: pass
+                fig.suptitle('Mean Angular (ϕ-bin) Energy — Stratified by Incident φ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
+    
+                fig = _plot_profile_grid(p_prof_R, p_titles_R, 'r-bin index', 'Mean deposited energy', 'r', ncols=ncols, show_ci=show_ci, x_tick_step=1)
+                if not normalize_per_event:
+                    for ax in np.atleast_1d(fig.axes): 
+                        try: ax.set_yscale('log')
+                        except Exception: pass
+                fig.suptitle('Mean Radial (r-bin) Energy — Stratified by Incident φ', fontsize=12, fontweight='bold'); pdf.savefig(fig); plt.close(fig)
 
     print(f"[write] {save_path}")
     return results
@@ -755,8 +929,11 @@ def analyze_phi_r_shifts(
 
 def main():
     p = argparse.ArgumentParser(description="LEMURS correlation & profile analysis")
-    sub = p.add_subparsers(dest='cmd', required=True)
 
+    p.add_argument('--dataset', choices=['lemurs', 'cc2'], required=True,
+                   help='Which dataset: LEMURS has angles; CC2 does not.')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    
     pc = sub.add_parser('corr', help='Stratified correlation matrices (Layers/ϕ/r) -> PDF')
     pc.add_argument('--data', type=str, required=True, help='Path to .npz or .h5/.hdf5 with X/E/theta/phi')
     pc.add_argument('--n-energy-bins', type=int, default=10)
@@ -766,6 +943,13 @@ def main():
     pc.add_argument('--save', type=str, default='stratified_correlations.pdf')
     pc.add_argument('--annotate', action='store_true')
     pc.add_argument('--ncols', type=int, default=3)
+    pc.add_argument('--normalize-per-event', action='store_true',
+                help='Divide each event by its total deposited energy (shape-only correlations)')
+    pc.add_argument('--log1p', action='store_true',
+                    help='Compute correlations on log1p-transformed features')
+    pc.add_argument('--spearman', action='store_true',
+                    help='Use Spearman (Pearson on ranks). If used with --log1p, ranks are of log1p(features).')
+
 
     pm = sub.add_parser('means', help='Stratified mean profiles (Layers/ϕ/r) -> PDF')
     pm.add_argument('--data', type=str, required=True)
@@ -803,17 +987,25 @@ def main():
 
     args = p.parse_args()
     path = Path(args.data)
+    X, E, th, ph = _load_any(path, args.dataset)
+    if args.dataset == 'cc2': 
+        bin_file_path='/project/biocomplexity/fa7sa/calo_dreamer/src/challenge_files/binning_dataset_2.xml'
+        X = reshape_flat_using_xml(X, bin_file_path, order="LPR")
+        
+       
 
+        
     if args.cmd == 'corr':
-        X, E, th, ph = _load_any(path)
+        #X, E, th, ph = _load_any(path)
         compute_stratified_correlations(
             shower=X, E_inc=E, theta=th, phi=ph,
             n_energy_bins=args.n_energy_bins, n_theta_bins=args.n_theta_bins, n_phi_bins=args.n_phi_bins,
-            min_samples=args.min_samples, save_path=args.save, annotate=args.annotate, ncols=args.ncols
+            min_samples=args.min_samples, save_path=args.save, annotate=args.annotate, ncols=args.ncols,
+            normalize_per_event=args.normalize_per_event, use_log1p=args.log1p, use_spearman=args.spearman
         )
 
     elif args.cmd == 'means':
-        X, E, th, ph = _load_any(path)
+        #X, E, th, ph = _load_any(path)
         compute_and_plot_mean_profiles(
             shower=X, E_inc=E, theta=th, phi=ph,
             n_energy_bins=args.n_energy_bins, n_theta_bins=args.n_theta_bins, n_phi_bins=args.n_phi_bins,
@@ -822,7 +1014,7 @@ def main():
         )
 
     elif args.cmd == 'phi-r':
-        X, E, th, ph = _load_any(path)
+        #X, E, th, ph = _load_any(path)
         analyze_phi_r_shifts(
             shower=X, theta_rad=th, phi_rad=ph,
             n_theta_bins=args.n_theta_bins, n_phi_bins=args.n_phi_bins,
@@ -831,7 +1023,7 @@ def main():
         )
 
     elif args.cmd == 'global-corr':
-        X, E, th, ph = _load_any(path)
+        #X, E, th, ph = _load_any(path)
         compute_global_correlations(shower=X, save_path=args.save, annotate=args.annotate)
 
     elif args.cmd == 'layer-shifts':
